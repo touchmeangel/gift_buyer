@@ -6,6 +6,7 @@ on:
 
 jobs:
   docker-deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
@@ -25,6 +26,7 @@ jobs:
         run: docker push ${{ secrets.DOCKER_NAME }}/${{ vars.IMAGE_NAME }}:latest
 
   server-deploy:
+    if: github.ref == 'refs/heads/main'
     needs: docker-deploy
     runs-on: ubuntu-latest
 
@@ -38,14 +40,64 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-
-      - name: Connect to VPS/actions
+      - name: Connect to VPS and deploy
         run: |
-          ssh -i ./vps_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+          ssh -o StrictHostKeyChecking=accept-new -i ./vps_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          set -euo pipefail
+          
+          IMAGE_NAME="${{ secrets.DOCKER_NAME }}/${{ vars.IMAGE_NAME }}:latest"
+          
+          echo "Logging into Docker..."
           echo "${{ secrets.DOCKER_PSWD }}" | docker login -u "${{ secrets.DOCKER_NAME }}" --password-stdin
+          
           cd ${{ vars.WORK_DIR }}
-          docker compose stop ${{ vars.SERVICE_NAME }}
-          docker pull ${{ secrets.DOCKER_NAME }}/${{ vars.IMAGE_NAME }}:latest
-          docker compose up -d --no-deps --build ${{ vars.SERVICE_NAME }}
-          docker rmi $(docker images ${{ secrets.DOCKER_NAME }}/${{ vars.IMAGE_NAME }} --filter "dangling=true" -q) || true
-          '
+          
+          echo "Pulling latest image: $IMAGE_NAME"
+          docker pull "$IMAGE_NAME"
+          
+          # Debug: Show compose config
+          echo "Checking docker-compose.yml for services..."
+          docker compose config --services
+          
+          # Find services using this image (more reliable method)
+          SERVICES=$(docker compose config --format json 2>/dev/null | \
+            python3 -c "import sys, json; \
+            data = json.load(sys.stdin); \
+            img = '$IMAGE_NAME'; \
+            services = [k for k, v in data.get('services', {}).items() if v.get('image') == img]; \
+            print(' '.join(services))" 2>/dev/null || echo "")
+          
+          # Fallback: simpler grep method
+          if [[ -z "$SERVICES" ]]; then
+            echo "Trying fallback method..."
+            SERVICES=$(docker compose config | awk -v img="$IMAGE_NAME" '
+              /^  [a-zA-Z0-9_-]+:/ { service=$1; gsub(/:/, "", service) }
+              /^    image:/ && $2 == img { print service }
+            ')
+          fi
+          
+          SERVICES=$(echo "$SERVICES" | xargs)
+          
+          if [[ -z "$SERVICES" ]]; then
+            echo "⚠️  No services found using image: $IMAGE_NAME"
+            echo "Available services:"
+            docker compose config --services
+            echo ""
+            echo "Checking what images are configured:"
+            docker compose config | grep "image:"
+            exit 1
+          fi
+          
+          echo "🔄 Restarting services: $SERVICES"
+          
+          for svc in $SERVICES; do
+            echo "  → Restarting $svc..."
+            docker compose up -d --force-recreate --no-deps "$svc"
+          done
+          
+          echo "🧹 Cleaning up old images..."
+          docker image prune -af --filter "until=24h"
+          
+          echo "✅ Deployment completed!"
+          EOF
+        shell: bash
